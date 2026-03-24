@@ -1,4 +1,8 @@
 flask
 flask-cors
 PyJWT
+psycopg2-binary
+flask-sqlalchemy
+python-dotenv
+flask-migrate
 pytest

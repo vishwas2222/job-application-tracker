@@ -1,36 +1,38 @@
+import os
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
-import jwt, datetime, os, json
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import jwt, datetime
+from dotenv import load_dotenv
 
+load_dotenv()
 app = Flask(__name__)
 CORS(app)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'supersecretkey')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'supersecretkey')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///dev.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
-users = []
-jobs = []
-applications = []
-next_job_id = 1
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(256), unique=True, nullable=False)
+    password = db.Column(db.String(256), nullable=False)
+    role = db.Column(db.String(32), nullable=False)
 
+class Job(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(256), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    company = db.Column(db.String(256), nullable=False)
 
-def _save_data():
-    with open(DATA_FILE, 'w') as f:
-        json.dump({'users': users, 'jobs': jobs, 'applications': applications, 'next_job_id': next_job_id}, f)
-
-
-def _load_data():
-    global users, jobs, applications, next_job_id
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            body = json.load(f)
-            users = body.get('users', [])
-            jobs = body.get('jobs', [])
-            applications = body.get('applications', [])
-            next_job_id = body.get('next_job_id', 1)
-
-
-_load_data()
+class Application(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    job_id = db.Column(db.Integer, db.ForeignKey('job.id'), nullable=False)
+    applicant = db.Column(db.String(256), nullable=False)
+    status = db.Column(db.String(32), nullable=False, default='applied')
 
 
 def auth_required(role=None):
@@ -45,7 +47,6 @@ def auth_required(role=None):
         abort(403, 'Forbidden')
     return payload
 
-
 @app.route('/api/auth/signup', methods=['POST'])
 def signup():
     data = request.json
@@ -54,97 +55,92 @@ def signup():
     role = data.get('role', 'applicant')
     if not email or not password:
         return jsonify({'error': 'Email and password required'}), 400
-    if any(u['email'] == email for u in users):
+    if User.query.filter_by(email=email).first():
         return jsonify({'error': 'User exists'}), 400
-    users.append({'email': email, 'password': password, 'role': role})
-    _save_data()
+    user = User(email=email, password=password, role=role)
+    db.session.add(user)
+    db.session.commit()
     return jsonify({'message': 'User created'}), 201
-
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json
     email = data.get('email')
     password = data.get('password')
-    user = next((u for u in users if u['email'] == email and u['password'] == password), None)
+    user = User.query.filter_by(email=email, password=password).first()
     if not user:
         return jsonify({'error': 'Invalid credentials'}), 401
-    token = jwt.encode({'email': user['email'], 'role': user['role'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=10)}, app.config['SECRET_KEY'], algorithm='HS256')
+    token = jwt.encode({'email': user.email, 'role': user.role, 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=10)}, app.config['SECRET_KEY'], algorithm='HS256')
     return jsonify({'token': token})
-
 
 @app.route('/api/jobs', methods=['GET'])
 def list_jobs():
     auth_required()
-    return jsonify(jobs)
-
+    jobs = Job.query.all()
+    return jsonify([{'id': j.id, 'title': j.title, 'description': j.description, 'company': j.company} for j in jobs])
 
 @app.route('/api/jobs', methods=['POST'])
 def create_job():
     payload = auth_required(role='employer')
-    global next_job_id
     data = request.json
     title = data.get('title')
     description = data.get('description')
     if not title or not description:
         return jsonify({'error': 'Title and description required'}), 400
-    job = {'id': next_job_id, 'title': title, 'description': description, 'company': payload['email']}
-    next_job_id += 1
-    jobs.append(job)
-    _save_data()
-    return jsonify(job), 201
-
+    job = Job(title=title, description=description, company=payload['email'])
+    db.session.add(job)
+    db.session.commit()
+    return jsonify({'id': job.id, 'title': job.title, 'description': job.description, 'company': job.company}), 201
 
 @app.route('/api/jobs/<int:id>', methods=['PUT'])
 def update_job(id):
     payload = auth_required(role='employer')
-    job = next((j for j in jobs if j['id'] == id), None)
+    job = Job.query.get(id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
-    if job['company'] != payload['email']:
+    if job.company != payload['email']:
         return jsonify({'error': 'Forbidden'}), 403
     data = request.json
-    job['title'] = data.get('title', job['title'])
-    job['description'] = data.get('description', job['description'])
-    _save_data()
-    return jsonify(job)
-
+    job.title = data.get('title', job.title)
+    job.description = data.get('description', job.description)
+    db.session.commit()
+    return jsonify({'id': job.id, 'title': job.title, 'description': job.description, 'company': job.company})
 
 @app.route('/api/jobs/<int:id>', methods=['DELETE'])
 def delete_job(id):
     payload = auth_required(role='employer')
-    job = next((j for j in jobs if j['id'] == id), None)
+    job = Job.query.get(id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
-    if job['company'] != payload['email']:
+    if job.company != payload['email']:
         return jsonify({'error': 'Forbidden'}), 403
-    jobs.remove(job)
-    _save_data()
+    db.session.delete(job)
+    db.session.commit()
     return jsonify({'message': 'Deleted'})
-
 
 @app.route('/api/jobs/<int:id>/apply', methods=['POST'])
 def apply_job(id):
     payload = auth_required(role='applicant')
-    job = next((j for j in jobs if j['id'] == id), None)
+    job = Job.query.get(id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
-    if any(app['job_id'] == id and app['applicant'] == payload['email'] for app in applications):
+    existing = Application.query.filter_by(job_id=id, applicant=payload['email']).first()
+    if existing:
         return jsonify({'error': 'Already applied'}), 400
-    application = {'id': len(applications) + 1, 'job_id': id, 'applicant': payload['email'], 'status': 'applied'}
-    applications.append(application)
-    _save_data()
-    return jsonify(application), 201
-
+    application = Application(job_id=id, applicant=payload['email'], status='applied')
+    db.session.add(application)
+    db.session.commit()
+    return jsonify({'id': application.id, 'job_id': application.job_id, 'applicant': application.applicant, 'status': application.status}), 201
 
 @app.route('/api/applications', methods=['GET'])
 def list_applications():
     payload = auth_required()
     if payload['role'] == 'employer':
-        employer_jobs = {j['id'] for j in jobs if j['company'] == payload['email']}
-        return jsonify([a for a in applications if a['job_id'] in employer_jobs])
-    return jsonify([a for a in applications if a['applicant'] == payload['email']])
-
+        employer_jobs = [j.id for j in Job.query.filter_by(company=payload['email']).all()]
+        apps = Application.query.filter(Application.job_id.in_(employer_jobs)).all()
+    else:
+        apps = Application.query.filter_by(applicant=payload['email']).all()
+    return jsonify([{'id': a.id, 'job_id': a.job_id, 'applicant': a.applicant, 'status': a.status} for a in apps])
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
